@@ -79,6 +79,7 @@ Calc::CalcMain(const std::vector<NoteInfo>& NoteInfo,
 		std::vector<float> iteration_skillet_values(NUM_Skillset);
 
 		// overall and stam will be left as 0.f by this loop
+		// OVERALL OVERHAUL: overall will be set now
 		for (auto i = 0; i < NUM_Skillset; ++i) {
 			iteration_skillet_values[i] = Chisel(0.1F,
 												 10.24F,
@@ -88,9 +89,13 @@ Calc::CalcMain(const std::vector<NoteInfo>& NoteInfo,
 		}
 
 		// stam is based on which calc produced the highest output without it
+		// OVERALL OVERHAUL: temporarily 0 overall to exclude it
+		auto base_ovr = iteration_skillet_values[Skill_Overall];
+		iteration_skillet_values[Skill_Overall] = 0.F;
 		const auto highest_base_skillset =
 		  static_cast<Skillset>(max_index(iteration_skillet_values));
 		const auto base = iteration_skillet_values[highest_base_skillset];
+		iteration_skillet_values[Skill_Overall] = base_ovr;
 
 		/* rerun all with stam on, optimize by starting at the non-stam adjusted
 		 * base value for each skillset. we can actually set the stam floor to <
@@ -110,8 +115,13 @@ Calc::CalcMain(const std::vector<NoteInfo>& NoteInfo,
 			}
 		}
 
+		// OVERALL OVERHAUL: temporarily 0 overall to exclude it
+		// also use the pre-stam adjusted overall if higher
+		auto stam_ovr = iteration_skillet_values[Skill_Overall];
+		iteration_skillet_values[Skill_Overall] = 0.F;
 		const auto highest_stam_adjusted_skillset =
 		  static_cast<Skillset>(max_index(iteration_skillet_values));
+		iteration_skillet_values[Skill_Overall] = stam_ovr > base_ovr ? stam_ovr : base_ovr;
 
 		/* all relative scaling to specific skillsets should occur before this
 		 * point, not after (it ended up this way due to the normalizers which
@@ -204,12 +214,10 @@ Calc::CalcMain(const std::vector<NoteInfo>& NoteInfo,
 			}
 		}
 
-		/* finished all modifications to skillset values, set overall using
-		 * sigmoidal aggregation, but only let it buff files, don't set anything
-		 * below the highest skillset th */
-		float agg = aggregate_skill(iteration_skillet_values, 0.25L, (float)1.11, 0.0, (float)10.24);
-		auto highest = max_val(iteration_skillet_values);
-		iteration_skillet_values[Skill_Overall] = agg > highest ? agg : highest;
+		// OVERALL OVERHAUL: we don't need the sigmoidal average thingy anymore
+		// but we still need highest check if somehow overall isn't the highest
+		// (temporarily disabling this for debugging purposes)
+		//iteration_skillet_values[Skill_Overall] = max_val(iteration_skillet_values);
 
 		for (auto ssval : iteration_skillet_values) {
 			all_skillset_values[cur_iteration].push_back(ssval);
@@ -492,6 +500,117 @@ CalcInternal(float& gotpoints,
 	}
 }
 
+// OVERALL OVERHAUL: basically taking the highest* loss between every skillsets
+// from every interval
+// *: not exactly the highest because we don't want to overrate things
+void
+overall_loss(float& gotpoints,
+             const float& limiter_for_jack_that_buffs_tech,
+			 const float& x,
+			 const bool stam,
+			 Calc& calc,
+			 const int hand,
+			 const bool debug = false)
+{
+	std::vector<std::vector<float>> general_losses(0);
+	std::vector<float> tech_losses;
+	std::vector<float> jackspeed_losses(calc.numitv, 0);
+
+	std::vector<float> jack_that_buffs_tech(calc.numitv, 0);
+	auto total_jack_that_buffs_tech = 0.F;
+	auto multiplier_for_jack_that_buffs_tech = 0.F;
+
+	auto jackspeed_i = 0;
+	auto x_for_jack_that_buffs_tech = x * 0.75F;
+
+	const auto& v_jack = stam ? JackStamAdjust(x, calc, hand) : calc.jack_diff.at(hand);
+	const auto& v_jack_tech = stam ? JackStamAdjust(x_for_jack_that_buffs_tech, calc, hand) : calc.jack_diff.at(hand);
+	for (auto ss = 1; ss < NUM_Skillset; ++ss) {
+		if (
+		       ss != Skill_Stream
+		    && ss != Skill_Jumpstream
+		    && ss != Skill_Handstream
+		    && ss != Skill_Chordjack
+
+		    && ss != Skill_Technical) continue;
+
+		std::vector<float> ss_losses(calc.numitv, 0.F);
+
+		if (stam) StamAdjust(x, ss, calc, hand);
+		const auto* v = &(stam ? calc.stam_adj_diff : calc.base_adj_diff.at(hand).at(ss));
+
+		auto pointloss_pow_val = 1.7F;
+		if (ss == Skill_Chordjack) {
+			pointloss_pow_val = 1.8F;
+		} else if (ss == Skill_Technical) {
+			pointloss_pow_val = 2.F;
+		}
+
+		for (auto i = 0; i < calc.numitv; ++i){
+			auto* p = &(ss_losses.at(i));
+
+			auto _loss = 0.F;
+			if (x < (*v).at(i)) {
+				const auto pts = static_cast<float>(calc.itv_points.at(hand).at(i));
+				_loss += pts - (pts * fastpow(x / (*v).at(i), pointloss_pow_val));
+			}
+			*p += max(0.F, _loss * (
+				ss == Skill_Technical ? 1.2F :
+				1.F));
+		}
+
+		if (ss == Skill_Technical) tech_losses = std::move(ss_losses);
+		else general_losses.emplace_back(ss_losses);
+	}
+
+	for (auto i = 0; i < calc.numitv; ++i){
+		auto* jp = &(jackspeed_losses.at(i));
+		auto* jtp = &(jack_that_buffs_tech.at(i));
+
+		for (; jackspeed_i < v_jack.size(); ++jackspeed_i) {
+			const auto& y = v_jack[jackspeed_i];
+			const auto& yt = v_jack_tech[jackspeed_i];
+
+			if (static_cast<int>(y.first*2) != i) break;
+
+			if (x < y.second && y.second > 0.F) {
+				auto _loss = jack_pointloser_func(x, y.second);
+				*jp += _loss * 0.8F;
+			}
+
+			if (x_for_jack_that_buffs_tech < yt.second && yt.second > 0.F) {
+				auto _loss = jack_pointloser_func(x_for_jack_that_buffs_tech, yt.second);
+				*jtp += _loss;
+				total_jack_that_buffs_tech += _loss;
+			}
+		}
+	}
+
+	if (total_jack_that_buffs_tech > 0.F) {
+		auto jack_limit = fastsqrt(min(limiter_for_jack_that_buffs_tech, total_jack_that_buffs_tech));
+		multiplier_for_jack_that_buffs_tech = jack_limit / total_jack_that_buffs_tech;
+	}
+
+	auto total_loss = 0.F;
+	for (auto i = 0; i < calc.numitv; ++i){
+		auto loss = 0.F;
+		auto tech_loss = tech_losses.at(i);
+
+		for (auto ss = 1; ss < 4; ++ss) {
+			auto l = general_losses.at(ss).at(i);
+			if (l > loss) loss = l;
+		}
+
+		auto trial1 = loss;
+		auto trial2 = tech_loss + jack_that_buffs_tech.at(i)*multiplier_for_jack_that_buffs_tech;
+
+		loss = max(max(trial1, trial2), jackspeed_losses.at(i));
+		total_loss += loss;
+		if (debug) calc.debugPtLoss.at(hand).at(Skill_Overall).at(i) = abs(loss);
+	}
+	gotpoints -= total_loss;
+}
+
 auto
 Calc::InitializeKeycountLogic() -> void
 {
@@ -624,8 +743,8 @@ Calc::Chisel(const float player_skill,
 			 const bool stamina,
 			 const bool debugoutput) -> float
 {
-	// overall and stamina are calculated differently
-	if (ss == Skill_Overall || ss == Skill_Stamina) {
+	// stamina is calculated differently
+	if (ss == Skill_Stamina) {
 		return min_rating;
 	}
 
@@ -650,6 +769,9 @@ Calc::Chisel(const float player_skill,
 			case Skill_Chordjack:
 				gotpoints = MaxPoints * bad_newbie_skillsets_pbm;
 				break;
+			case Skill_Overall:
+				gotpoints = MaxPoints;
+				break;
 			default:
 				assert(0);
 				break;
@@ -664,6 +786,9 @@ Calc::Chisel(const float player_skill,
 				if (ss == Skill_JackSpeed) {
 					gotpoints -=
 					  jackloss(curr_player_skill, *this, hand, stamina);
+				} else if (ss == Skill_Overall) {
+					overall_loss(
+					  gotpoints, max_slap_dash_jack_cap_hack_tech_hat, curr_player_skill, stamina, *this, hand);
 				} else {
 					CalcInternal(
 					  gotpoints, curr_player_skill, ss, stamina, *this, hand);
@@ -743,6 +868,15 @@ Calc::Chisel(const float player_skill,
 			// fills jack_loss debug values
 			jackloss(curr_player_skill, *this, hand, stamina, debugoutput);
 
+			// fixes PtLoss for Overall
+			overall_loss(gotpoints,
+						 max_slap_dash_jack_cap_hack_tech_hat,
+						 curr_player_skill,
+						 stamina,
+						 *this,
+						 hand,
+						 debugoutput);
+
 			/* set total pattern mod value (excluding stam for now), essentially
 			 * this value is the cumulative effect of pattern mods on base nps
 			 * for everything but tech, and base tech for tech, this isn't 1:1
@@ -821,6 +955,12 @@ Calc::InitAdjDiff(Calc& calc, const int& hand)
 			}
 		}
 
+		// this is only for uhhh... "debugging purposes" -m1s
+		auto* ovr_diff = &(calc.base_adj_diff.at(hand).at(Skill_Overall).at(i));
+		*ovr_diff = 0.F;
+		auto* ovr_stam = &(calc.base_diff_for_stam_mod.at(hand).at(Skill_Overall).at(i));
+		*ovr_stam = 0.F;
+
 		// main loop, for each skillset that isn't overall or stam
 		for (auto ss = 0; ss < NUM_Skillset; ++ss) {
 			if (ss == Skill_Overall || ss == Skill_Stamina) {
@@ -848,6 +988,10 @@ Calc::InitAdjDiff(Calc& calc, const int& hand)
 											   adj_npsbase,
 											   ss,
 											   pmod_product_cur_interval);
+			if (ss != Skill_JackSpeed) {
+				*ovr_diff = max(*ovr_diff, *adj_diff);
+				*ovr_stam = max(*ovr_stam, *stam_base);
+			}
 		}
 	}
 }
